@@ -1,0 +1,51 @@
+{
+  "name": "EmuNexa",
+  "outputfilename": "EmuNexa",
+  "frontend:install": "npm install",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "author": {
+    "name": "EmuNexa Team",
+    "email": "team@emunexa.dev"
+  },
+  "info": {
+    "companyName": "EmuNexa",
+    "productName": "EmuNexa",
+    "productVersion": "1.0.0",
+    "copyright": "Copyright © 2025 EmuNexa Authors",
+    "comments": "Modern Android Virtualization Platform for Windows"
+  },
+  "windows": {
+    "webviewInstallMode": {
+      "mode": "download",
+      "url": "https://go.microsoft.com/fwlink/p/?LinkId=2124703"
+    },
+    "webviewBrowserCommandLineArguments": "--disable-features=msWebView2EnableDrm",
+    "nsis": {
+      "installerIcon": "build/icon.ico",
+      "uninstallerIcon": "build/icon.ico",
+      "installerHeaderIcon": "build/icon.ico",
+      "licenseFile": "LICENSE",
+      "headerImage": "build/header.bmp",
+      "welcomeImage": "build/welcome.bmp",
+      "displayLanguageSelector": true,
+      "allowElevation": true,
+      "createDesktopShortcut": "always",
+      "createStartMenuShortcut": true,
+      "shortcutName": "EmuNexa",
+      "runAfterInstall": true
+    }
+  },
+  "mac": {
+    "category": "public.app-category.developer-tools"
+  },
+  "linux": {
+    "desktop": {
+      "name": "EmuNexa",
+      "comment": "Modern Android Virtualization Platform",
+      "categories": ["Development", "Emulator"],
+      "icon": "build/icon.png"
+    }
+  }
+}

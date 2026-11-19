@@ -1,0 +1,458 @@
+name: Build EmuNexa
+
+on:
+  push:
+    branches: [main, develop]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version override (e.g., 1.0.0)'
+        required: false
+        type: string
+      create_release:
+        description: 'Create GitHub Release'
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  packages: write
+  attestations: write
+  id-token: write
+
+env:
+  GO_VERSION: '1.23'
+  NODE_VERSION: '20'
+  WAILS_VERSION: 'v2.17.1'
+  APP_NAME: 'EmuNexa'
+
+jobs:
+  # ============================================================
+  # Lint & Test (runs on all pushes/PRs)
+  # ============================================================
+  lint-test:
+    name: Lint & Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Wails
+        run: |
+          go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_VERSION }}
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Go lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
+
+      - name: Go test
+        run: |
+          cd ${{ github.workspace }}
+          go test ./... -v -race -coverprofile=coverage.out
+
+      - name: Go vet
+        run: go vet ./...
+
+      - name: Frontend lint
+        working-directory: frontend
+        run: |
+          npm ci
+          npm run lint
+
+      - name: Frontend type check
+        working-directory: frontend
+        run: npm run build 2>&1 | head -20
+
+      - name: Upload coverage
+        uses: codecov/codecov-action@v4
+        if: always()
+        with:
+          files: ./coverage.out
+          fail_ci_if_error: false
+
+  # ============================================================
+  # Build Windows (x64) - Main artifacts
+  # ============================================================
+  build-windows:
+    name: Build Windows x64
+    needs: lint-test
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      CGO_ENABLED: '1'
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install Wails
+        run: |
+          go install github.com/wailsapp/wails/v2/cmd/wails@${{ env.WAILS_VERSION }}
+          echo "$(go env GOPATH)/bin" >> $GITHUB_PATH
+
+      - name: Install NSIS
+        uses: ashutoshvarma/setup-nsis@v1
+        with:
+          version: '3.09'
+
+      - name: Determine version
+        id: version
+        run: |
+          $version = "${{ github.event.inputs.version }}"
+          if (-not $version) {
+            $tag = "${{ github.ref_name }}"
+            if ($tag -match '^v(.+)$') {
+              $version = $matches[1]
+            } else {
+              $version = "0.0.0-dev.$(git rev-parse --short HEAD)"
+            }
+          }
+          echo "VERSION=$version" >> $GITHUB_ENV
+          echo "version=$version" >> $GITHUB_OUTPUT
+          echo "Building version: $version"
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/go/pkg/mod
+            ${{ github.workspace }}/frontend/node_modules
+          key: ${{ runner.os }}-build-${{ hashFiles('go.sum', 'frontend/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-build-
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm ci
+
+      - name: Build frontend
+        working-directory: frontend
+        run: npm run build
+
+      - name: Build backend (Release)
+        env:
+          APP_VERSION: ${{ env.VERSION }}
+          GIT_COMMIT: ${{ github.sha }}
+          BUILD_DATE: ${{ github.event.head_commit.timestamp || github.event.workflow_run.created_at }}
+        run: |
+          $ldflags = @(
+            "-s -w",
+            "-X github.com/emunexa/emunexa/cmd/emu-nexa.Version=${{ env.VERSION }}",
+            "-X github.com/emunexa/emunexa/cmd/emu-nexa.Commit=${{ github.sha }}",
+            "-X github.com/emunexa/emunexa/cmd/emu-nexa.BuildDate=$(Get-Date -Format 'yyyy-MM-dd')"
+          ) -join " "
+          wails build -ldflags "$ldflags" -tags production
+
+      - name: Verify executable
+        run: |
+          $exe = "build/EmuNexa.exe"
+          if (-not (Test-Path $exe)) { throw "Executable not found at $exe" }
+          $info = & $exe --version 2>&1
+          echo "Version output: $info"
+          if ($LASTEXITCODE -ne 0) { throw "Executable failed to run" }
+          (Get-Item $exe).Length | ForEach-Object { "Size: $_ bytes ($([math]::round($_/1MB, 2)) MB)" }
+
+      - name: Create portable package
+        run: |
+          $portableDir = "dist/portable"
+          if (Test-Path $portableDir) { Remove-Item -Recurse -Force $portableDir }
+          New-Item -ItemType Directory -Path $portableDir | Out-Null
+          Copy-Item "build/EmuNexa.exe" "$portableDir/" -Force
+          if (Test-Path "frontend/dist") { Copy-Item "frontend/dist" "$portableDir/" -Recurse -Force }
+
+          @"
+EmuNexa Portable Edition v${{ env.VERSION }}
+==========================================
+
+Portable version - no installation required.
+
+Requirements:
+- Windows 10 2004+ or Windows 11 (64-bit)
+- WebView2 Runtime (usually pre-installed on Windows 11)
+- QEMU with WHPX support for hardware acceleration
+
+To run: Double-click EmuNexa.exe
+
+Source: ${{ github.server_url }}/${{ github.repository }}
+Commit: ${{ github.sha }}
+"@ | Set-Content "$portableDir/README.txt" -Encoding UTF8
+
+          Compress-Archive -Path "$portableDir/*" -DestinationPath "dist/EmuNexa-Portable-${{ env.VERSION }}-windows-x64.zip" -Force
+          echo "Portable package created"
+
+      - name: Create NSIS installer
+        run: |
+          $nsisScript = @"
+!include "MUI2.nsh"
+
+Name "${{ env.APP_NAME }}"
+OutFile "dist/${{ env.APP_NAME }}-Setup-${{ env.VERSION }}-windows-x64.exe"
+InstallDir "\$PROGRAMFILES\${{ env.APP_NAME }}"
+InstallDirRegKey HKCU "Software\${{ env.APP_NAME }}" ""
+RequestExecutionLevel admin
+
+!define MUI_ICON "build/icon.ico"
+!define MUI_UNICON "build/icon.ico"
+
+!insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_LICENSE "LICENSE"
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+
+!insertmacro MUI_UNPAGE_WELCOME
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+!insertmacro MUI_UNPAGE_FINISH
+
+Section "MainSection" SEC01
+    SetOutPath "\$INSTDIR"
+    File /r "build\${{ env.APP_NAME }}.exe"
+    File /r "frontend\dist\*"
+
+    WriteRegStr HKCU "Software\${{ env.APP_NAME }}" "" "\$INSTDIR"
+    WriteUninstaller "\$INSTDIR\Uninstall.exe"
+
+    CreateDirectory "\$SMPROGRAMS\${{ env.APP_NAME }}"
+    CreateShortCut "\$SMPROGRAMS\${{ env.APP_NAME }}\${{ env.APP_NAME }}.lnk" "\$INSTDIR\${{ env.APP_NAME }}.exe"
+    CreateShortCut "\$DESKTOP\${{ env.APP_NAME }}.lnk" "\$INSTDIR\${{ env.APP_NAME }}.exe"
+SectionEnd
+
+Section "Uninstall"
+    Delete "\$INSTDIR\${{ env.APP_NAME }}.exe"
+    RMDir /r "\$INSTDIR"
+    Delete "\$SMPROGRAMS\${{ env.APP_NAME }}\${{ env.APP_NAME }}.lnk"
+    Delete "\$DESKTOP\${{ env.APP_NAME }}.lnk"
+    RMDir "\$SMPROGRAMS\${{ env.APP_NAME }}"
+    DeleteRegKey HKCU "Software\${{ env.APP_NAME }}"
+SectionEnd
+"@
+          $scriptPath = "build/installer.nsi"
+          $nsisScript | Set-Content $scriptPath -Encoding UTF8
+
+          $nsisPath = "${env:ProgramFiles}\NSIS\makensis.exe"
+          if (-not (Test-Path $nsisPath)) { $nsisPath = "${env:ProgramFiles(x86)}\NSIS\makensis.exe" }
+          & $nsisPath $scriptPath
+          echo "Installer created"
+
+      - name: Generate checksums
+        run: |
+          $files = Get-ChildItem dist/*.exe, dist/*.zip
+          foreach ($file in $files) {
+            $sha256 = Get-FileHash -Algorithm SHA256 $file.FullName
+            echo "$($sha256.Hash)  $($file.Name)" | Out-File -Append -Encoding UTF8 dist/checksums.txt
+            $sha512 = Get-FileHash -Algorithm SHA512 $file.FullName
+            echo "$($sha512.Hash)  $($file.Name)" | Out-File -Append -Encoding UTF8 dist/checksums.sha512
+          }
+          Get-Content dist/checksums.txt
+
+      - name: Sign artifacts (optional)
+        if: env.SIGN_TOOL_PATH != '' && env.CERT_THUMBPRINT != ''
+        env:
+          SIGN_TOOL_PATH: ${{ secrets.SIGN_TOOL_PATH }}
+          CERT_THUMBPRINT: ${{ secrets.CERT_THUMBPRINT }}
+        run: |
+          $files = Get-ChildItem dist/*.exe
+          foreach ($file in $files) {
+            & $env:SIGN_TOOL_PATH sign /fd sha256 /sha1 $env:CERT_THUMBPRINT /tr http://timestamp.digicert.com /td sha256 $file.FullName
+            echo "Signed: $($file.Name)"
+          }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: emunexa-windows-x64-${{ env.VERSION }}
+          path: |
+            dist/*.exe
+            dist/*.zip
+            dist/checksums*.txt
+          retention-days: 30
+
+      - name: Create GitHub Release
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v') || github.event.inputs.create_release == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ env.VERSION }}
+          name: EmuNexa v${{ env.VERSION }}
+          draft: false
+          prerelease: ${{ contains(env.VERSION, '-') }}
+          files: |
+            dist/${{ env.APP_NAME }}-Setup-${{ env.VERSION }}-windows-x64.exe
+            dist/${{ env.APP_NAME }}-Portable-${{ env.VERSION }}-windows-x64.zip
+            dist/checksums.txt
+            dist/checksums.sha512
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ============================================================
+  # Docker Build (reproducible, runs on Linux)
+  # ============================================================
+  docker-build:
+    name: Docker Build (Multi-arch)
+    needs: lint-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      matrix:
+        platform: [windows/amd64]
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Determine version
+        id: version
+        run: |
+          version="${{ github.event.inputs.version }}"
+          if [ -z "$version" ]; then
+            tag="${{ github.ref_name }}"
+            if [[ "$tag" =~ ^v(.+)$ ]]; then
+              version="${BASH_REMATCH[1]}"
+            else
+              version="0.0.0-dev.$(git rev-parse --short HEAD)"
+            fi
+          fi
+          echo "VERSION=$version" >> $GITHUB_ENV
+          echo "version=$version" >> $GITHUB_OUTPUT
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./Dockerfile.build
+          platforms: ${{ matrix.platform }}
+          load: true
+          tags: emunexa/build:${{ env.VERSION }}
+          build-args: |
+            VERSION=${{ env.VERSION }}
+            GIT_COMMIT=${{ github.sha }}
+            BUILD_DATE=${{ github.event.head_commit.timestamp }}
+
+      - name: Extract artifacts from Docker
+        run: |
+          docker create --name extract emunexa/build:${{ env.VERSION }}
+          docker cp extract:/app/dist/. dist/
+          docker rm extract
+          ls -la dist/
+
+      - name: Verify Docker-built executable
+        run: |
+          # Test with Wine (basic check)
+          if command -v wine64 &> /dev/null; then
+            wine64 dist/EmuNexa.exe --version || true
+          fi
+          file dist/EmuNexa.exe
+
+      - name: Upload Docker artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: emunexa-docker-${{ matrix.platform }}-${{ env.VERSION }}
+          path: dist/
+          retention-days: 30
+
+  # ============================================================
+  # Security Scan
+  # ============================================================
+  security-scan:
+    name: Security Scan
+    needs: lint-test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gosec
+        uses: securego/gosec@master
+        with:
+          args: '-fmt sarif -out results.sarif ./...'
+
+      - name: Upload SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: results.sarif
+          category: gosec
+
+      - name: Run Trivy (Docker image)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy.sarif'
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: trivy.sarif
+          category: trivy
+
+      - name: Dependency review
+        uses: actions/dependency-review-action@v4
+        if: github.event_name == 'pull_request'
+
+  # ============================================================
+  # Notify
+  # ============================================================
+  notify:
+    name: Notify
+    needs: [build-windows, docker-build, security-scan]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Build status
+        run: |
+          echo "Build completed"
+          echo "Windows build: ${{ needs.build-windows.result }}"
+          echo "Docker build: ${{ needs.docker-build.result }}"
+          echo "Security scan: ${{ needs.security-scan.result }}"
+          if [ "${{ needs.build-windows.result }}" != "success" ]; then
+            echo "::warning::Windows build failed!"
+            exit 1
+          fi

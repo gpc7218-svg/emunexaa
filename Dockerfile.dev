@@ -1,0 +1,54 @@
+# EmuNexa Development Environment
+# Hot-reload development with Wails dev server
+#
+# Usage:
+#   docker build -t emunexa/dev -f Dockerfile.dev .
+#   docker run -it --rm -v $(pwd):/app -p 3000:3000 -p 34115:34115 emunexa/dev
+
+FROM mcr.microsoft.com/windows/servercore:ltsc2022 AS dev-base
+
+ENV CHOCOLATEY_ACCEPT_LICENSE=1
+ENV NUGET_SCRATCH=/tmp
+
+# Install Chocolatey
+RUN powershell -Command \
+    Set-ExecutionPolicy Bypass -Scope Process -Force; \
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; \
+    iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+
+ENV PATH="${env:PATH};C:\ProgramData\chocolatey\bin"
+
+# Install development dependencies
+RUN choco install -y --no-progress \
+    golang \
+    nodejs-lts \
+    git \
+    wget \
+    --version=1.23.0 \
+    --version=20.12.0
+
+# Install Wails CLI
+RUN go install github.com/wailsapp/wails/v2/cmd/wails@v2.17.1
+ENV PATH="${env:PATH};C:\go\bin;C:\Users\ContainerAdministrator\go\bin"
+
+# Install Air for Go hot reload
+RUN go install github.com/air-verse/air@latest
+
+# Verify
+RUN go version && node --version && wails version && air -v
+
+WORKDIR /app
+
+# Copy go.mod/go.sum for caching
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy frontend package files
+COPY frontend/package*.json ./frontend/
+WORKDIR /app/frontend
+RUN npm ci --prefer-offline --no-audit --no-fund
+
+WORKDIR /app
+
+# Default command - runs Wails dev server with hot reload
+CMD ["wails", "dev", "-v"]

@@ -1,0 +1,143 @@
+version: '3.8'
+
+# EmuNexa Docker Compose for local development and building
+#
+# Usage:
+#   # Build all artifacts (Windows x64)
+#   docker compose -f docker-compose.yml build builder
+#   docker compose -f docker-compose.yml run --rm builder
+#
+#   # Cross-compile from Linux/macOS
+#   docker compose -f docker-compose.yml -f docker-compose.linux.yml build linux-builder
+#   docker compose -f docker-compose.yml -f docker-compose.linux.yml run --rm linux-builder
+#
+#   # Test runtime
+#   docker compose -f docker-compose.yml run --rm runtime-test
+
+services:
+  # ============================================================
+  # Windows Builder (native Windows container)
+  # ============================================================
+  builder:
+    build:
+      context: .
+      dockerfile: Dockerfile.build
+      target: packager
+      args:
+        VERSION: ${VERSION:-dev}
+        GIT_COMMIT: ${GIT_COMMIT:-$(git rev-parse --short HEAD)}
+        BUILD_DATE: ${BUILD_DATE:-$(date -u +%Y-%m-%d)}
+    volumes:
+      - ./dist:/app/dist
+      - ./build:/app/build
+    environment:
+      - VERSION=${VERSION:-dev}
+    # Run on Windows Docker host only
+    deploy:
+      resources:
+        limits:
+          memory: 4G
+
+  # ============================================================
+  # Frontend Builder (can run on Linux)
+  # ============================================================
+  frontend-builder:
+    build:
+      context: .
+      dockerfile: Dockerfile.build
+      target: frontend-build
+    volumes:
+      - ./frontend:/app/frontend
+      - ./frontend/dist:/app/frontend/dist
+      - frontend_node_modules:/app/frontend/node_modules
+    working_dir: /app/frontend
+
+  # ============================================================
+  # Backend Builder (can run on Linux with cross-compile)
+  # ============================================================
+  backend-builder:
+    build:
+      context: .
+      dockerfile: Dockerfile.build
+      target: backend-build
+      args:
+        VERSION: ${VERSION:-dev}
+        GIT_COMMIT: ${GIT_COMMIT:-$(git rev-parse --short HEAD)}
+        BUILD_DATE: ${BUILD_DATE:-$(date -u +%Y-%m-%d)}
+    volumes:
+      - .:/app
+      - ./frontend/dist:/app/frontend/dist
+      - go_mod_cache:/root/go/pkg/mod
+    working_dir: /app
+    environment:
+      - CGO_ENABLED=1
+
+  # ============================================================
+  # Linux Cross-Compile (for Linux/macOS hosts)
+  # ============================================================
+  linux-builder:
+    build:
+      context: .
+      dockerfile: Dockerfile.build
+      target: linux-cross-compile
+      args:
+        VERSION: ${VERSION:-dev}
+        GIT_COMMIT: ${GIT_COMMIT:-$(git rev-parse --short HEAD)}
+        BUILD_DATE: ${BUILD_DATE:-$(date -u +%Y-%m-%d)}
+    volumes:
+      - .:/app
+      - ./frontend/dist:/app/frontend/dist
+      - go_mod_cache:/go/pkg/mod
+      - ./dist:/app/dist
+    working_dir: /app
+    environment:
+      - CGO_ENABLED=1
+      - GOOS=windows
+      - GOARCH=amd64
+
+  # ============================================================
+  # Runtime Test (Windows container)
+  # ============================================================
+  runtime-test:
+    build:
+      context: .
+      dockerfile: Dockerfile.build
+      target: runtime-test
+    volumes:
+      - ./dist:/app/dist
+    depends_on:
+      - builder
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+
+  # ============================================================
+  # Development Environment (hot reload)
+  # ============================================================
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    volumes:
+      - .:/app
+      - ./frontend:/app/frontend
+      - frontend_node_modules:/app/frontend/node_modules
+      - go_mod_cache:/root/go/pkg/mod
+    ports:
+      - "3000:3000"  # Vite dev server
+      - "34115:34115" # Wails dev server
+    environment:
+      - WAILS_DEV=1
+    command: wails dev -v
+    stdin_open: true
+    tty: true
+
+volumes:
+  frontend_node_modules:
+  go_mod_cache:
+
+# ============================================================
+# Linux-specific overrides (docker-compose.linux.yml)
+# ============================================================
+# Use with: docker compose -f docker-compose.yml -f docker-compose.linux.yml up linux-builder

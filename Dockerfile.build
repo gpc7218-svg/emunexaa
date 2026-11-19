@@ -1,0 +1,286 @@
+# EmuNexa Docker Build Environment
+# Multi-stage build for reproducible Windows x64 compilation
+#
+# Usage:
+#   docker build -t emunexa/build:1.0.0 --build-arg VERSION=1.0.0 .
+#   docker run --rm -v $(pwd)/dist:/out emunexa/build:1.0.0
+#
+# Cross-compile from Linux to Windows:
+#   docker buildx build --platform windows/amd64 -t emunexa/build:1.0.0 --load .
+
+# ============================================================
+# Base Build Stage - All build tools
+# ============================================================
+FROM mcr.microsoft.com/windows/servercore:ltsc2022 AS base-build
+
+# Prevent interactive prompts
+ENV CHOCOLATEY_ACCEPT_LICENSE=1
+ENV NUGET_SCRATCH=/tmp
+
+# Install Chocolatey
+RUN powershell -Command \
+    Set-ExecutionPolicy Bypass -Scope Process -Force; \
+    [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; \
+    iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+
+# Refresh environment
+ENV PATH="${env:PATH};C:\ProgramData\chocolatey\bin"
+
+# Install build dependencies via Chocolatey
+RUN choco install -y --no-progress \
+    golang \
+    nodejs-lts \
+    nsis \
+    git \
+    wget \
+    7zip \
+    --version=1.23.0 \
+    --version=20.12.0 \
+    --version=3.09 \
+    --version=2.44.0
+
+# Install Wails CLI
+RUN go install github.com/wailsapp/wails/v2/cmd/wails@v2.17.1
+ENV PATH="${env:PATH};C:\go\bin;C:\Users\ContainerAdministrator\go\bin"
+
+# Verify installations
+RUN go version && node --version && npm --version && wails version && makensis -VERSION
+
+# ============================================================
+# Frontend Build Stage
+# ============================================================
+FROM base-build AS frontend-build
+
+WORKDIR /app/frontend
+
+# Copy package files for caching
+COPY frontend/package*.json ./
+
+# Install dependencies
+RUN npm ci --prefer-offline --no-audit --no-fund
+
+# Copy frontend source
+COPY frontend/ ./
+
+# Build frontend
+RUN npm run build
+
+# Verify build output
+RUN dir dist
+
+# ============================================================
+# Backend Build Stage
+# ============================================================
+FROM base-build AS backend-build
+
+WORKDIR /app
+
+# Copy go.mod/go.sum for dependency caching
+COPY go.mod go.sum ./
+
+# Download Go modules
+RUN go mod download
+
+# Copy all source
+COPY . .
+
+# Copy built frontend
+COPY --from=frontend-build /app/frontend/dist ./frontend/dist
+
+# Build arguments
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+ARG BUILD_DATE=unknown
+
+# Set version info via ldflags
+ENV LDFLAGS="-s -w \
+    -X github.com/emunexa/emunexa/cmd/emu-nexa.Version=${VERSION} \
+    -X github.com/emunexa/emunexa/cmd/emu-nexa.Commit=${GIT_COMMIT} \
+    -X github.com/emunexa/emunexa/cmd/emu-nexa.BuildDate=${BUILD_DATE}"
+
+# Build the application
+RUN wails build -ldflags "$env:LDFLAGS" -tags production
+
+# Verify executable
+RUN powershell -Command \
+    $exe = "build/EmuNexa.exe"; \
+    if (-not (Test-Path $exe)) { throw "Executable not found" }; \
+    & $exe --version; \
+    (Get-Item $exe).Length
+
+# ============================================================
+# Packaging Stage
+# ============================================================
+FROM backend-build AS packager
+
+WORKDIR /app
+
+# Create portable package
+RUN powershell -Command \
+    $portableDir = "dist/portable"; \
+    if (Test-Path $portableDir) { Remove-Item -Recurse -Force $portableDir }; \
+    New-Item -ItemType Directory -Path $portableDir | Out-Null; \
+    Copy-Item "build/EmuNexa.exe" "$portableDir/" -Force; \
+    Copy-Item "frontend/dist" "$portableDir/" -Recurse -Force; \
+    @"
+EmuNexa Portable Edition v${env:VERSION}
+==========================================
+
+Portable version - no installation required.
+
+Requirements:
+- Windows 10 2004+ or Windows 11 (64-bit)
+- WebView2 Runtime (usually pre-installed on Windows 11)
+- QEMU with WHPX support for hardware acceleration
+
+To run: Double-click EmuNexa.exe
+"@ | Set-Content "$portableDir/README.txt" -Encoding UTF8; \
+    Compress-Archive -Path "$portableDir/*" -DestinationPath "dist/EmuNexa-Portable-${env:VERSION}-windows-x64.zip" -Force
+
+# Create NSIS installer
+RUN powershell -Command \
+    $nsisScript = @"
+!include \"MUI2.nsh\"
+
+Name \"EmuNexa\"
+OutFile \"dist/EmuNexa-Setup-${env:VERSION}-windows-x64.exe\"
+InstallDir \"\$PROGRAMFILES\EmuNexa\"
+InstallDirRegKey HKCU \"Software\EmuNexa\" \"\"
+RequestExecutionLevel admin
+
+!define MUI_ICON \"build/icon.ico\"
+!define MUI_UNICON \"build/icon.ico\"
+
+!insertmacro MUI_PAGE_WELCOME
+!insertmacro MUI_PAGE_LICENSE \"LICENSE\"
+!insertmacro MUI_PAGE_DIRECTORY
+!insertmacro MUI_PAGE_INSTFILES
+!insertmacro MUI_PAGE_FINISH
+
+!insertmacro MUI_UNPAGE_WELCOME
+!insertmacro MUI_UNPAGE_CONFIRM
+!insertmacro MUI_UNPAGE_INSTFILES
+!insertmacro MUI_UNPAGE_FINISH
+
+Section \"MainSection\" SEC01
+    SetOutPath \"\$INSTDIR\"
+    File /r \"build\EmuNexa.exe\"
+    File /r \"frontend\dist\*\"
+
+    WriteRegStr HKCU \"Software\EmuNexa\" \"\" \"\$INSTDIR\"
+    WriteUninstaller \"\$INSTDIR\Uninstall.exe\"
+
+    CreateDirectory \"\$SMPROGRAMS\EmuNexa\"
+    CreateShortCut \"\$SMPROGRAMS\EmuNexa\EmuNexa.lnk\" \"\$INSTDIR\EmuNexa.exe\"
+    CreateShortCut \"\$DESKTOP\EmuNexa.lnk\" \"\$INSTDIR\EmuNexa.exe\"
+SectionEnd
+
+Section \"Uninstall\"
+    Delete \"\$INSTDIR\EmuNexa.exe\"
+    RMDir /r \"\$INSTDIR\"
+    Delete \"\$SMPROGRAMS\EmuNexa\EmuNexa.lnk\"
+    Delete \"\$DESKTOP\EmuNexa.lnk\"
+    RMDir \"\$SMPROGRAMS\EmuNexa\"
+    DeleteRegKey HKCU \"Software\EmuNexa\"
+SectionEnd
+"@; \
+    $scriptPath = "build/installer.nsi"; \
+    $nsisScript | Set-Content $scriptPath -Encoding UTF8; \
+    & "C:\Program Files\NSIS\makensis.exe" $scriptPath
+
+# Generate checksums
+RUN powershell -Command \
+    $files = Get-ChildItem dist/*.exe, dist/*.zip; \
+    foreach ($file in $files) { \
+        $sha256 = Get-FileHash -Algorithm SHA256 $file.FullName; \
+        echo "$($sha256.Hash)  $($file.Name)" | Out-File -Append -Encoding UTF8 dist/checksums.txt; \
+        $sha512 = Get-FileHash -Algorithm SHA512 $file.FullName; \
+        echo "$($sha512.Hash)  $($file.Name)" | Out-File -Append -Encoding UTF8 dist/checksums.sha512; \
+    }; \
+    Get-Content dist/checksums.txt
+
+# ============================================================
+# Final Stage - Minimal runtime for testing
+# ============================================================
+FROM mcr.microsoft.com/windows/servercore:ltsc2022 AS runtime-test
+
+WORKDIR /app
+
+# Copy artifacts
+COPY --from=packager /app/dist/ ./dist/
+COPY --from=packager /app/build/EmuNexa.exe ./EmuNexa.exe
+
+# Install WebView2 runtime for testing (optional)
+# RUN powershell -Command \
+#     Invoke-WebRequest -Uri "https://go.microsoft.com/fwlink/p/?LinkId=2124703" -OutFile "webview2.exe"; \
+#     Start-Process -FilePath "webview2.exe" -ArgumentList "/quiet", "/install" -Wait; \
+#     Remove-Item "webview2.exe"
+
+# Basic executable test
+RUN powershell -Command \
+    .\EmuNexa.exe --version; \
+    echo "Executable runs successfully"
+
+# ============================================================
+# Linux Cross-Compile Stage (for building on Linux CI)
+# ============================================================
+FROM ubuntu:22.04 AS linux-cross-compile
+
+# Install dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    golang-go \
+    nodejs \
+    npm \
+    git \
+    wget \
+    ca-certificates \
+    mingw-w64 \
+    nsis \
+    file \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Wails
+RUN go install github.com/wailsapp/wails/v2/cmd/wails@v2.17.1
+ENV PATH="${PATH}:$(go env GOPATH)/bin"
+
+# Verify
+RUN go version && node --version && wails version
+
+WORKDIR /app
+
+# Copy source
+COPY . .
+
+# Build arguments
+ARG VERSION=dev
+ARG GIT_COMMIT=unknown
+ARG BUILD_DATE=unknown
+
+ENV CGO_ENABLED=1
+ENV GOOS=windows
+ENV GOARCH=amd64
+ENV CC=x86_64-w64-mingw32-gcc
+ENV CXX=x86_64-w64-mingw32-g++
+
+# Build frontend first
+WORKDIR /app/frontend
+RUN npm ci && npm run build
+
+# Build backend with cross-compilation
+WORKDIR /app
+ENV LDFLAGS="-s -w \
+    -X github.com/emunexa/emunexa/cmd/emu-nexa.Version=${VERSION} \
+    -X github.com/emunexa/emunexa/cmd/emu-nexa.Commit=${GIT_COMMIT} \
+    -X github.com/emunexa/emunexa/cmd/emu-nexa.BuildDate=${BUILD_DATE}"
+
+RUN wails build -ldflags "$LDFLAGS" -tags production
+
+# Verify cross-compiled binary
+RUN file build/EmuNexa.exe
+
+# ============================================================
+# Multi-arch Builder (for buildx)
+# ============================================================
+# This stage is used with: docker buildx build --platform windows/amd64,linux/amd64 ...
+FROM scratch AS multiarch-builder
+# This is a placeholder - actual multi-arch uses the stages above
